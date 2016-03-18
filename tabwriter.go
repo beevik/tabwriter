@@ -11,16 +11,6 @@ const (
 	specified
 )
 
-type cell struct {
-	size     int // Number of bytes in cell
-	width    int // Number of runes in the cell
-	maxwidth int // Maximum width seen in this cell's column so far
-}
-
-type line struct {
-	cells []cell
-}
-
 type Writer struct {
 	output   io.Writer
 	minwidth int
@@ -30,25 +20,39 @@ type Writer struct {
 	flags    uint
 	colflags []uint
 
-	buf   bytes.Buffer // unformatted bytes accumulated until flush
-	lines []line       // lines accumulated until flush
-	cell  cell         // currently updating cell
+	padbytes []byte       // array of padchars to use when padding
+	buf      bytes.Buffer // unformatted bytes accumulated until flush
+	lines    []line       // lines accumulated until flush
+	cell     cell         // currently updating cell
 }
 
-func NewWriter(output io.Writer, minwidth, tabwidth, padding int, padchar byte, flags uint) *Writer {
-	w := &Writer{
-		output:   output,
-		minwidth: minwidth,
-		tabwidth: tabwidth,
-		padding:  padding,
-		padchar:  padchar,
-		flags:    flags,
-		colflags: []uint{},
+type cell struct {
+	size     int // number of bytes in cell
+	width    int // number of runes in the cell
+	maxwidth int // maximum width seen in this cell's column so far
+}
+
+type line struct {
+	cells []cell
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	} else {
+		return b
 	}
-	w.reset()
-	return w
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+// reset completely resets the state of the tabwriter.
 func (w *Writer) reset() {
 	w.buf.Reset()
 	w.cell = cell{}
@@ -56,11 +60,23 @@ func (w *Writer) reset() {
 	w.addLine()
 }
 
+// getFlags returns the tabwriter flags that should be used for column col.
+func (w *Writer) getFlags(col int) uint {
+	flags := w.flags
+	if col < len(w.colflags) && (w.colflags[col]&specified) != 0 {
+		flags = w.colflags[col]
+	}
+	return flags
+}
+
+// addTextToCell updates the contents of the working cell.
 func (w *Writer) addTextToCell(text []byte) {
 	w.buf.Write(text)
 	w.cell.size += len(text)
 }
 
+// addCellToLine adds the current working cell to the current working line
+// and starts a new working cell.
 func (w *Writer) addCellToLine() {
 	// Calculate the cell's width (the number of runes).
 	b := w.buf.Bytes()
@@ -69,7 +85,7 @@ func (w *Writer) addCellToLine() {
 	linecount := len(w.lines)
 	curr := &w.lines[linecount-1]
 
-	w.cell.maxwidth = w.cell.width
+	w.cell.maxwidth = max(w.minwidth, w.cell.width+w.padding)
 	if linecount > 1 {
 		// Examine the cell in the previous line at the same column. Compute
 		// this cell's maxwidth based on that cell's maxwidth and this cell's
@@ -87,8 +103,60 @@ func (w *Writer) addCellToLine() {
 	w.cell = cell{}
 }
 
+// addLine adds a new, empty line to the working set.
 func (w *Writer) addLine() {
 	w.lines = append(w.lines, line{[]cell{}})
+}
+
+// tabifyLine adjusts the maxwidth of each cell in a line so that each
+// cell begins on a tab stop.
+func (w *Writer) tabifyLine(line *line) {
+	for i := range line.cells {
+		c := &line.cells[i]
+		remainder := c.maxwidth % w.tabwidth
+		if remainder != 0 {
+			c.maxwidth += w.tabwidth - remainder
+		}
+	}
+}
+
+// writeCell outputs a cell's contents and its padding.
+func (w *Writer) writeCell(text []byte, padding int, flags uint) {
+	if w.padchar == '\t' {
+		w.output.Write(text)
+		stops := (padding + w.tabwidth - 1) / w.tabwidth
+		w.writePadding(stops)
+	} else if (flags & AlignRight) != 0 {
+		w.writePadding(padding)
+		w.output.Write(text)
+	} else {
+		w.output.Write(text)
+		w.writePadding(padding)
+	}
+}
+
+// writePadding outputs n pad characters.
+func (w *Writer) writePadding(n int) {
+	for n > len(w.padbytes) {
+		w.output.Write(w.padbytes)
+		n -= len(w.padbytes)
+	}
+	w.output.Write(w.padbytes[:n])
+}
+
+func NewWriter(output io.Writer, minwidth, tabwidth, padding int, padchar byte, flags uint) *Writer {
+	w := &Writer{
+		output:   output,
+		minwidth: minwidth,
+		tabwidth: tabwidth,
+		padding:  padding,
+		padchar:  padchar,
+		flags:    flags,
+		colflags: []uint{},
+		padbytes: bytes.Repeat([]byte{padchar}, 8),
+	}
+	w.reset()
+	return w
 }
 
 func (w *Writer) Write(buf []byte) (n int, err error) {
@@ -110,7 +178,6 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 
 	w.addTextToCell(buf[n:])
 	n = len(buf)
-
 	return
 }
 
@@ -124,9 +191,16 @@ func (w *Writer) Flush() {
 		w.lines = w.lines[:len(w.lines)-1]
 	}
 
-	// Propagate the accumulated maxwidths from the bottom lines upward.
+	// Adjust each line's cell maxwidth values
 	for i := len(w.lines) - 1; i > 0; i-- {
 		curr := &w.lines[i]
+
+		if w.padchar == '\t' {
+			// Adjust column widths to hit tab stops.
+			w.tabifyLine(curr)
+		}
+
+		// Propagate the accumulated maxwidths from the bottom lines upward.
 		prev := &w.lines[i-1]
 		for j, jc := 0, min(len(prev.cells), len(curr.cells)); j < jc; j++ {
 			prev.cells[j].maxwidth =
@@ -134,20 +208,14 @@ func (w *Writer) Flush() {
 		}
 	}
 
-	// Format the lines.
+	// Format and output the lines.
 	p := 0
 	for _, l := range w.lines {
 		for j, c := range l.cells {
-			ralign := (w.getflags(j) & AlignRight) != 0
-			if ralign {
-				w.output.Write(bytes.Repeat([]byte{' '}, c.maxwidth-c.width))
-				w.output.Write(w.buf.Bytes()[p : p+c.size])
-				w.output.Write([]byte{' '})
-			} else {
-				w.output.Write(w.buf.Bytes()[p : p+c.size])
-				w.output.Write(bytes.Repeat([]byte{' '}, c.maxwidth-c.width+1))
-			}
-			p = p + c.size
+			text := w.buf.Bytes()[p : p+c.size]
+			padding := c.maxwidth - c.width
+			w.writeCell(text, padding, w.getFlags(j))
+			p += c.size
 		}
 		w.output.Write([]byte{'\n'})
 	}
@@ -162,28 +230,4 @@ func (w *Writer) SetColumnFlags(col int, flags uint) {
 		w.colflags = colflags
 	}
 	w.colflags[col] = flags | specified
-}
-
-func (w *Writer) getflags(col int) uint {
-	flags := w.flags
-	if col < len(w.colflags) && (w.colflags[col]&specified) != 0 {
-		flags = w.colflags[col]
-	}
-	return flags
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	} else {
-		return b
-	}
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	} else {
-		return b
-	}
 }
