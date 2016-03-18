@@ -1,3 +1,30 @@
+// Package tabwriter implements a write filter (tabwriter.Writer) that
+// translates tabbed columns in input into properly aligned text.
+//
+// It is a drop-in replacement for the standard library's text/tabwriter
+// package.
+//
+// Differences between this tabwriter and the go standard library's version:
+//
+// This tabwriter allows setting formatting flags per-column. So you can have
+// some columns that are align-right and some that are align-left.
+//
+// This tabwriter properly right-aligns the last column. The standard
+// library's version always left-aligns the last column regardless of the
+// formatting flags.
+//
+// This tabwriter processes '\r' as a "new-row" indicator, meaning that
+// all text between it and the next '\n' appears indented on a new line
+// without affecting subsequent tab formatting. This is most useful for
+// usage text descriptions.
+//
+// This tabwriter always outputs a newline after a flush.
+//
+// This library does not support HTML filtering, escaped text sequences,
+// tab-indenting for padchar's other than '\t', or discarding of empty
+// columns.
+//
+// This library ignores '\v' and '\f' characters.
 package tabwriter
 
 import (
@@ -7,10 +34,14 @@ import (
 )
 
 const (
+	// Force right-alignment of a column's content.
 	AlignRight uint = 1 << iota
+
 	specified
 )
 
+// A Writer is a filter that inserts padding around tab-delimited columns in
+// its input to align them in the output.
 type Writer struct {
 	output   io.Writer
 	minwidth int
@@ -56,17 +87,17 @@ func max(a, b int) int {
 func (w *Writer) reset() {
 	w.buf.Reset()
 	w.cell = cell{}
-	w.lines = nil
-	w.addLine()
+	w.lines = w.lines[0:0]
+	w.addNewLine()
 }
 
 // getFlags returns the tabwriter flags that should be used for column col.
 func (w *Writer) getFlags(col int) uint {
-	flags := w.flags
 	if col < len(w.colflags) && (w.colflags[col]&specified) != 0 {
-		flags = w.colflags[col]
+		return w.colflags[col]
+	} else {
+		return w.flags
 	}
-	return flags
 }
 
 // addTextToCell updates the contents of the working cell.
@@ -75,15 +106,26 @@ func (w *Writer) addTextToCell(text []byte) {
 	w.cell.size += len(text)
 }
 
-// addCellToLine adds the current working cell to the current working line
-// and starts a new working cell.
-func (w *Writer) addCellToLine() {
+// addCellToLine adds the current working cell to the current working line and
+// starts a new working cell.
+func (w *Writer) addCellToLine(term bool) {
 	// Calculate the cell's width (the number of runes).
 	b := w.buf.Bytes()
 	w.cell.width = utf8.RuneCount(b[len(b)-w.cell.size:])
 
 	linecount := len(w.lines)
-	curr := &w.lines[linecount-1]
+	line := &w.lines[linecount-1]
+
+	// If a line is being terminated and the working cell is empty, we're
+	// done.
+	if term && w.cell.size == 0 {
+		w.cell = cell{}
+		if len(line.cells) == 0 {
+			// Flush on an empty line.
+			w.Flush()
+		}
+		return
+	}
 
 	w.cell.maxwidth = max(w.minwidth, w.cell.width+w.padding)
 	if linecount > 1 {
@@ -92,19 +134,19 @@ func (w *Writer) addCellToLine() {
 		// width. This causes the maxwidth for each column to accumulate
 		// downwards. When we flush, we'll traverse the lines in reverse and
 		// copy the per-column maxwidth values upwards.
-		col := len(curr.cells)
+		col := len(line.cells)
 		prev := &w.lines[linecount-2]
 		if col < len(prev.cells) {
 			w.cell.maxwidth = max(w.cell.maxwidth, prev.cells[col].maxwidth)
 		}
 	}
 
-	curr.cells = append(curr.cells, w.cell)
+	line.cells = append(line.cells, w.cell)
 	w.cell = cell{}
 }
 
-// addLine adds a new, empty line to the working set.
-func (w *Writer) addLine() {
+// addNewLine adds a new, empty line to the working set.
+func (w *Writer) addNewLine() {
 	w.lines = append(w.lines, line{[]cell{}})
 }
 
@@ -121,15 +163,30 @@ func (w *Writer) tabifyLine(line *line) {
 }
 
 // writeCell outputs a cell's contents and its padding.
-func (w *Writer) writeCell(text []byte, padding int, flags uint) {
-	if w.padchar == '\t' {
+func (w *Writer) writeCell(text []byte, padding int, flags uint, term bool) {
+	switch {
+	case (term && (flags&AlignRight == 0)) || padding == 0:
+		// Don't pad the last cell in a left-aligned line.
 		w.output.Write(text)
-		stops := (padding + w.tabwidth - 1) / w.tabwidth
-		w.writePadding(stops)
-	} else if (flags & AlignRight) != 0 {
-		w.writePadding(padding)
+
+	case w.padchar == '\t':
+		// Write text and then pad with tabs. Never right-align when padding
+		// with tabs.
 		w.output.Write(text)
-	} else {
+		w.writePadding((padding + w.tabwidth - 1) / w.tabwidth)
+
+	case (flags & AlignRight) != 0:
+		// When aligning right, use one of the pad characters on the right
+		// side of the text. This way, two adjacent columns that are align-
+		// right and align-left will not touch one another.
+		w.writePadding(padding - 1)
+		w.output.Write(text)
+		if !term {
+			w.writePadding(1)
+		}
+
+	default:
+		// When aligning left, pad on the right.
 		w.output.Write(text)
 		w.writePadding(padding)
 	}
@@ -144,6 +201,7 @@ func (w *Writer) writePadding(n int) {
 	w.output.Write(w.padbytes[:n])
 }
 
+// NewWriter creates and initializes a new tabwriter.Writer.
 func NewWriter(output io.Writer, minwidth, tabwidth, padding int, padchar byte, flags uint) *Writer {
 	w := &Writer{
 		output:   output,
@@ -159,6 +217,16 @@ func NewWriter(output io.Writer, minwidth, tabwidth, padding int, padchar byte, 
 	return w
 }
 
+// Init initializes a tabwriter.Writer, which filters its output to the
+// writer in the first parameter. The remaining parameters control formatting:
+//
+//  minwidth    minimal cell width including padding
+//  tabwidth    width of a tab in spaces, used to determine location of
+//              tab stops
+//  padding     extra pad characters added to cells
+//  padchar     the character to use for padding. If tab ('\t') is used, then
+//              all padding is tabbed and left-aligned using tabwidth.
+//  flags       formatting control flags
 func (w *Writer) Init(output io.Writer, minwidth, tabwidth, padding int, padchar byte, flags uint) *Writer {
 	w.output = output
 	w.minwidth = minwidth
@@ -172,19 +240,21 @@ func (w *Writer) Init(output io.Writer, minwidth, tabwidth, padding int, padchar
 	return w
 }
 
+// Write writes buf to the writer w, returning the number of bytes written
+// and any errors encountered while writing to the underlying stream.
 func (w *Writer) Write(buf []byte) (n int, err error) {
 	n = 0
 	for i, ch := range buf {
 		switch ch {
 		case '\n':
 			w.addTextToCell(buf[n:i])
-			w.addCellToLine()
+			w.addCellToLine(true)
 			n = i + 1
-			w.addLine()
+			w.addNewLine()
 
 		case '\t':
 			w.addTextToCell(buf[n:i])
-			w.addCellToLine()
+			w.addCellToLine(false)
 			n = i + 1
 		}
 	}
@@ -194,9 +264,11 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 	return
 }
 
+// Flush triggers the formatting and output of tabbed text to the underlying
+// stream.
 func (w *Writer) Flush() {
 	if w.cell.size > 0 {
-		w.addCellToLine()
+		w.addCellToLine(true)
 	}
 
 	// If the last line is empty, strip it.
@@ -224,10 +296,11 @@ func (w *Writer) Flush() {
 	// Format and output the lines.
 	p := 0
 	for _, l := range w.lines {
-		for j, c := range l.cells {
+		for col, c := range l.cells {
 			text := w.buf.Bytes()[p : p+c.size]
 			padding := c.maxwidth - c.width
-			w.writeCell(text, padding, w.getFlags(j))
+			term := col+1 == len(l.cells)
+			w.writeCell(text, padding, w.getFlags(col), term)
 			p += c.size
 		}
 		w.output.Write([]byte{'\n'})
@@ -236,6 +309,7 @@ func (w *Writer) Flush() {
 	w.reset()
 }
 
+// SetColumnFlags sets column-specific formatting flags for column 'col'.
 func (w *Writer) SetColumnFlags(col int, flags uint) {
 	if col >= len(w.colflags) {
 		colflags := make([]uint, col+1)
