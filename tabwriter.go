@@ -159,6 +159,19 @@ func NewWriter(output io.Writer, minwidth, tabwidth, padding int, padchar byte, 
 	return w
 }
 
+func (w *Writer) Init(output io.Writer, minwidth, tabwidth, padding int, padchar byte, flags uint) *Writer {
+	w.output = output
+	w.minwidth = minwidth
+	w.tabwidth = tabwidth
+	w.padding = padding
+	w.padchar = padchar
+	w.flags = flags
+	w.colflags = []uint{}
+	w.padbytes = bytes.Repeat([]byte{padchar}, 8)
+	w.reset()
+	return w
+}
+
 func (w *Writer) Write(buf []byte) (n int, err error) {
 	n = 0
 	for i, ch := range buf {
