@@ -33,7 +33,8 @@ import (
 )
 
 const (
-	// Force right-alignment of a column's content.
+	// AlignRight forces right-alignment of a column's content. Default is
+	// left alignment.
 	AlignRight uint = 1 << iota
 
 	specified
@@ -92,17 +93,15 @@ var (
 func min(a, b int) int {
 	if a < b {
 		return a
-	} else {
-		return b
 	}
+	return b
 }
 
 func max(a, b int) int {
 	if a > b {
 		return a
-	} else {
-		return b
 	}
+	return b
 }
 
 // reset completely resets the state of the tabwriter.
@@ -117,9 +116,8 @@ func (w *Writer) reset() {
 func (w *Writer) getFormat(col int) format {
 	if col >= 64 || w.formatColumnBits&(uint64(1)<<uint(col)) == 0 {
 		return w.format
-	} else {
-		return w.formatColumn[col]
 	}
+	return w.formatColumn[col]
 }
 
 // addTextToCell updates the contents of the working cell.
